@@ -21,16 +21,15 @@ PIUSB 직접 통신 방식 (libpi_pi_gcs2.so 불필요)
 
 import time
 import logging
-import usb.backend.libusb1
+import numpy as np
 from pipython.pidevice.interfaces.piusb import PIUSB
 
 logger = logging.getLogger(__name__)
 
 # ── 장비 설정 ──────────────────────────────────────────
-LIBUSB_PATH = "/usr/lib/x86_64-linux-gnu/libusb-1.0.so.0.4.0"
-SERIAL      = "0126011356"
-PID         = 0x101e
-VID         = 0x1a72
+SERIAL = "0126011356"
+PID    = 0x101e
+VID    = 0x1a72
 
 # P-562.3CD 이동 범위 (µm) — 데이터시트 기준
 SOFT_LIMIT_X = (0.0, 200.0)
@@ -52,29 +51,15 @@ class Piezo:
         soft_limits: dict = None,
         settle_time: float = 0.02,
     ):
-        """
-        Parameters
-        ----------
-        serial : str
-            E-727 시리얼 번호
-        soft_limits : dict, optional
-            소프트 이동 범위 제한
-            예) {'X': (0, 200), 'Y': (0, 200), 'Z': (0, 200)}
-        settle_time : float
-            이동 후 안정화 대기 시간 (초), 데이터시트 기준 10ms 이내
-        """
-        self._serial      = serial
+        self._serial = serial
         self._settle_time = settle_time
         self._soft_limits = soft_limits or {
             'X': SOFT_LIMIT_X,
             'Y': SOFT_LIMIT_Y,
             'Z': SOFT_LIMIT_Z,
         }
-
-        self._gateway   = None
+        self._gateway = None
         self._connected = False
-
-        # 초기화 전 위치 저장용
         self._saved_position = None
 
     # ──────────────────────────────────────────────────
@@ -84,11 +69,9 @@ class Piezo:
     def connect(self) -> None:
         """USB 연결"""
         logger.info("피에조 USB 연결 중... (시리얼: %s)", self._serial)
-
         self._gateway = PIUSB()
         self._gateway._timeout = 10000
         self._gateway.connect(serialnumber=self._serial, pid=PID, vid=VID)
-
         self._connected = True
         logger.info("피에조 연결 성공!")
 
@@ -137,7 +120,7 @@ class Piezo:
 
         # 2. 서보 ON
         self._servo_on()
-       time.sleep(1.0)
+        time.sleep(0.5)
 
         # 3. 이전 위치로 복귀
         if restore_position and self._saved_position:
@@ -240,7 +223,7 @@ class Piezo:
         """
         self._check_connected()
         self._gateway.send('POS?\n')
-        time.sleep(0.5)
+        time.sleep(1.0)
         raw = self._gateway.read()
         return self._parse_position(raw)
 
@@ -271,26 +254,10 @@ class Piezo:
         """
         1축 스캔 제너레이터
 
-        Parameters
-        ----------
-        axis : str
-            스캔 축 ('X', 'Y', 'Z')
-        start, stop : float
-            스캔 범위 (µm)
-        n_points : int
-            스캔 포인트 수
-        settle_time : float
-            각 포인트 안정화 대기 시간 (초)
-
-        Yields
-        ------
-        float : 현재 위치
-
         사용 예시:
             for pos in piezo.scan_axis('X', 0, 50, 101):
                 counts = apd.read()
         """
-        import numpy as np
         axis_num = {'X': 1, 'Y': 2, 'Z': 3}[axis]
         positions = np.linspace(start, stop, n_points)
 
@@ -309,15 +276,10 @@ class Piezo:
         """
         XY 2D 래스터 스캔 제너레이터 (스네이크 패턴)
 
-        Yields
-        ------
-        tuple : (ix, iy, x_pos, y_pos)
-
         사용 예시:
             for ix, iy, x, y in piezo.scan_xy(0, 50, 101, 0, 50, 101):
                 image[iy, ix] = apd.read()
         """
-        import numpy as np
         x_positions = np.linspace(x_start, x_stop, x_points)
         y_positions = np.linspace(y_start, y_stop, y_points)
 
