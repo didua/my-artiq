@@ -7,7 +7,7 @@ E-727.3CDA + P-562.3CD 피에조 나노 스테이지 제어 모듈
 PIUSB 직접 통신 방식 (libpi_pi_gcs2.so 불필요)
 
 사용 예시:
-    from layer0.piezo import Piezo
+    from kist_nv.layer0.piezo import Piezo
 
     piezo = Piezo()
     piezo.connect()
@@ -22,7 +22,6 @@ PIUSB 직접 통신 방식 (libpi_pi_gcs2.so 불필요)
 import time
 import logging
 import usb.backend.libusb1
-from pipython.pidevice.gcsmessages import GCSMessages
 from pipython.pidevice.interfaces.piusb import PIUSB
 
 logger = logging.getLogger(__name__)
@@ -33,7 +32,7 @@ SERIAL      = "0126011356"
 PID         = 0x101e
 VID         = 0x1a72
 
-# P-562.3CD 이동 범위 (µm) — 데이터시트 확인 후 수정
+# P-562.3CD 이동 범위 (µm) — 데이터시트 기준
 SOFT_LIMIT_X = (0.0, 200.0)
 SOFT_LIMIT_Y = (0.0, 200.0)
 SOFT_LIMIT_Z = (0.0, 200.0)
@@ -62,7 +61,7 @@ class Piezo:
             소프트 이동 범위 제한
             예) {'X': (0, 200), 'Y': (0, 200), 'Z': (0, 200)}
         settle_time : float
-            이동 후 안정화 대기 시간 (초)
+            이동 후 안정화 대기 시간 (초), 데이터시트 기준 10ms 이내
         """
         self._serial      = serial
         self._settle_time = settle_time
@@ -86,19 +85,12 @@ class Piezo:
         """USB 연결"""
         logger.info("피에조 USB 연결 중... (시리얼: %s)", self._serial)
 
-        backend = usb.backend.libusb1.get_backend(
-            find_library=lambda x: LIBUSB_PATH
-        )
-
         self._gateway = PIUSB()
         self._gateway._timeout = 10000
         self._gateway.connect(serialnumber=self._serial, pid=PID, vid=VID)
 
-        # IDN 확인
-        idn = self._read_idn()
-        logger.info("피에조 연결 성공! %s", idn)
-
         self._connected = True
+        logger.info("피에조 연결 성공!")
 
     def close(self) -> None:
         """연결 종료"""
@@ -344,15 +336,6 @@ class Piezo:
     # ──────────────────────────────────────────────────
     # 내부 헬퍼
     # ──────────────────────────────────────────────────
-
-    def _read_idn(self) -> str:
-        """IDN 읽기 (응답이 두 번에 나눠서 옴)"""
-        self._gateway.send('*IDN?\n')
-        time.sleep(1.0)
-        idn1 = self._gateway.read()
-        time.sleep(0.5)
-        idn2 = self._gateway.read()
-        return (idn1.strip() + idn2.strip())
 
     def _wait_on_target(self, timeout: float = 10.0) -> None:
         """이동 완료 대기"""
