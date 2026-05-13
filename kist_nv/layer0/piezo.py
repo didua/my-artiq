@@ -137,7 +137,7 @@ class Piezo:
 
         # 2. 서보 ON
         self._servo_on()
-        time.sleep(0.5)
+       time.sleep(1.0)
 
         # 3. 이전 위치로 복귀
         if restore_position and self._saved_position:
