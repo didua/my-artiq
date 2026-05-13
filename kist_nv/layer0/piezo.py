@@ -67,13 +67,18 @@ class Piezo:
     # ──────────────────────────────────────────────────
 
     def connect(self) -> None:
-        """USB 연결"""
+        """USB 연결 — IDN 읽기 후 명령어 수신 가능"""
         logger.info("피에조 USB 연결 중... (시리얼: %s)", self._serial)
+
         self._gateway = PIUSB()
         self._gateway._timeout = 10000
         self._gateway.connect(serialnumber=self._serial, pid=PID, vid=VID)
+
+        # E-727은 연결 직후 IDN을 먼저 읽어야 다른 명령어를 받음
+        idn = self._read_idn()
+        logger.info("피에조 연결 성공! %s", idn)
+
         self._connected = True
-        logger.info("피에조 연결 성공!")
 
     def close(self) -> None:
         """연결 종료"""
@@ -299,12 +304,25 @@ class Piezo:
     # 내부 헬퍼
     # ──────────────────────────────────────────────────
 
+    def _read_idn(self) -> str:
+        """
+        IDN 읽기
+        E-727은 연결 직후 IDN을 먼저 읽어야 다른 명령어를 받음
+        응답이 두 번에 나눠서 옴
+        """
+        self._gateway.send('*IDN?\n')
+        time.sleep(1.0)
+        idn1 = self._gateway.read()
+        time.sleep(0.5)
+        idn2 = self._gateway.read()
+        return (idn1.strip() + idn2.strip())
+
     def _wait_on_target(self, timeout: float = 10.0) -> None:
         """이동 완료 대기"""
         deadline = time.time() + timeout
         while time.time() < deadline:
             self._gateway.send('ONT?\n')
-            time.sleep(0.1)
+            time.sleep(0.3)
             try:
                 resp = self._gateway.read()
                 if resp.count('1') >= 3:
