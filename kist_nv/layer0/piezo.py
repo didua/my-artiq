@@ -220,7 +220,7 @@ class Piezo:
 
     def get_position(self) -> tuple:
         """
-        현재 XYZ 위치 반환
+        현재 XYZ 위치 반환 (폴링 방식 — 응답 오면 바로 반환)
 
         Returns
         -------
@@ -228,9 +228,18 @@ class Piezo:
         """
         self._check_connected()
         self._gateway.send('POS?\n')
-        time.sleep(1.0)
-        raw = self._gateway.read()
-        return self._parse_position(raw)
+
+        # 응답이 올 때까지 최대 5초 대기
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                raw = self._gateway.read()
+                if '=' in raw:
+                    return self._parse_position(raw)
+            except Exception:
+                time.sleep(0.05)
+
+        raise TimeoutError("위치 읽기 타임아웃")
 
     @property
     def x(self) -> float:
@@ -318,11 +327,11 @@ class Piezo:
         return (idn1.strip() + idn2.strip())
 
     def _wait_on_target(self, timeout: float = 10.0) -> None:
-        """이동 완료 대기"""
+        """이동 완료 대기 (폴링 방식)"""
         deadline = time.time() + timeout
         while time.time() < deadline:
             self._gateway.send('ONT?\n')
-            time.sleep(0.3)
+            time.sleep(0.1)
             try:
                 resp = self._gateway.read()
                 if resp.count('1') >= 3:
