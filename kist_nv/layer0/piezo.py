@@ -1,21 +1,60 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# WDLEE 변경 이력 (2026-05-14)
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. TCP(LAN) 통신 지원 추가
+#    - Piezo(transport='tcp', host='192.168.50.63') 형태로 사용
+#    - pipython의 PISocket을 PIUSB와 동일한 send/read/close 인터페이스로 활용
+#    - USB(기본) / TCP 두 가지 transport를 같은 클래스에서 선택 가능
+#
+# 2. get_network_info() 수정 → 컨트롤러 멎는 문제 해결
+#    - 이전: IPADR? / MAC? / IPSTART? 개별 쿼리 → E-727이 인식 못함 → USB 큐 깨짐 → 연결 끊김
+#    - 변경: PI GCS 표준 IFC? 한 번에 일괄 조회 → 안전. 반환은 {key: value} 딕셔너리.
+#    - USB 큐 깨졌을 때 복구는 `usbreset <bus>/<dev>` 한 방으로 가능 (전원 재인가 불필요).
+#
+# 3. _query() 응답 종결 규칙 정정
+#    - PI GCS 멀티라인 응답은 '<data> \n<data> \n...<data>\n' 형식
+#      (마지막 라인 외에는 '<space>\n' 으로 이어짐)
+#    - 이전: 첫 '\n' 보고 종료 → 멀티라인 중간에서 잘림.
+#    - 변경: endswith('\n') and not endswith(' \n') 로 판정하여 끝까지 누적.
+#    - 응답 없으면 TimeoutError 발생.
+#
+# 4. get_position() / _wait_on_target() 도 _query() 기반으로 통일
+#    - 이전: 한 번 read한 결과만 보고 파싱 시도 → TCP에서 청크 단위 도착 시 첫 조각만 보고 깨짐.
+#    - 변경: _query()로 PI GCS 종결 규칙까지 누적해서 받은 다음 파싱.
+#
+# 5. _read_idn() 제거
+#    - 기존 1.5초 sleep 후 2회 read 패턴은 USB에서 IDN이 두 패킷으로 쪼개져 오던 케이스 대응이었음.
+#    - 이제 _query('*IDN?') 가 PI GCS 종결 규칙으로 알아서 처리 → 별도 helper 불필요.
+#
+# 운영상 주의 (DHCP IP 가변)
+#    - 현재 컨트롤러는 IPSTART=1 (DHCP). 2026-05-14 시점 라우터 할당 IP는 192.168.50.63.
+#    - lease 갱신 시 IP가 바뀔 수 있음 → 라우터에서 MAC d8-47-8f-c0-b7-f3 에 고정 IP 예약 권장.
+#    - LAN 케이블 빠진 채 부팅하면 fallback static IP 10.10.2.175 로 떨어짐 (다른 망이라 접근 불가).
+#      그땐 USB로 붙어서 get_network_info() 로 상태 확인.
+# ─────────────────────────────────────────────────────────────────────────────
+
 """
 piezo.py
 --------
 layer0/piezo.py
 
 E-727.3CDA + P-562.3CD 피에조 나노 스테이지 제어 모듈
-PIUSB 직접 통신 방식 (libpi_pi_gcs2.so 불필요)
+PIUSB / PISocket 직접 통신 방식 (libpi_pi_gcs2.so 불필요)
 
 사용 예시:
     from kist_nv.layer0.piezo import Piezo
 
+    # USB 연결 (기본)
     piezo = Piezo()
     piezo.connect()
-    piezo.initialize()
 
+    # LAN(TCP) 연결
+    piezo = Piezo(transport='tcp', host='192.168.50.63')
+    piezo.connect()
+
+    piezo.initialize()
     piezo.move_to(x=50.0, y=50.0, z=10.0)
     x, y, z = piezo.get_position()
-
     piezo.close()
 """
 
@@ -23,6 +62,7 @@ import time
 import logging
 import numpy as np
 from pipython.pidevice.interfaces.piusb import PIUSB
+from pipython.pidevice.interfaces.pisocket import PISocket
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +87,34 @@ class Piezo:
 
     def __init__(
         self,
+        transport: str = 'usb',
         serial: str = SERIAL,
+        host: str = None,
+        port: int = 50000,
         soft_limits: dict = None,
         settle_time: float = 0.02,
     ):
+        """
+        Parameters
+        ----------
+        transport : 'usb' | 'tcp'
+            'usb' (기본) → PIUSB. serial로 디바이스 식별.
+            'tcp'        → PISocket. host:port 로 연결.
+        serial : str
+            USB 시리얼 번호 (transport='usb' 일 때).
+        host : str
+            컨트롤러 IP (transport='tcp' 일 때 필수).
+            ⚠ DHCP 사용 시 IP가 바뀔 수 있음. 라우터에서 MAC 고정 IP 예약 권장.
+        port : int
+            TCP 포트 (PI 기본 50000).
+        """
+        if transport not in ('usb', 'tcp'):
+            raise ValueError(f"transport는 'usb' 또는 'tcp' 여야 함 (받은 값: {transport!r})")
+
+        self._transport = transport
         self._serial = serial
+        self._host = host
+        self._port = port
         self._settle_time = settle_time
         self._soft_limits = soft_limits or {
             'X': SOFT_LIMIT_X,
@@ -67,15 +130,21 @@ class Piezo:
     # ──────────────────────────────────────────────────
 
     def connect(self) -> None:
-        """USB 연결 — IDN 읽기 후 명령어 수신 가능"""
-        logger.info("피에조 USB 연결 중... (시리얼: %s)", self._serial)
+        """USB 또는 TCP 연결. IDN 읽기까지 마쳐서 명령어 수신 가능 상태로."""
+        if self._transport == 'tcp':
+            if not self._host:
+                raise ValueError("transport='tcp' 일 때 host 인자 필수")
+            logger.info("피에조 TCP 연결 중... (%s:%d)", self._host, self._port)
+            self._gateway = PISocket(host=self._host, port=self._port)
+        else:
+            logger.info("피에조 USB 연결 중... (시리얼: %s)", self._serial)
+            self._gateway = PIUSB()
+            self._gateway._timeout = 10000
+            self._gateway.connect(serialnumber=self._serial, pid=PID, vid=VID)
 
-        self._gateway = PIUSB()
-        self._gateway._timeout = 10000
-        self._gateway.connect(serialnumber=self._serial, pid=PID, vid=VID)
-
-        # E-727은 연결 직후 IDN을 먼저 읽어야 다른 명령어를 받음
-        idn = self._read_idn()
+        # E-727 USB는 연결 직후 IDN을 먼저 읽어야 다른 명령어를 받음.
+        # TCP에선 불필요하지만 IDN으로 sanity check.
+        idn = self._query('*IDN?', timeout=3.0)
         logger.info("피에조 연결 성공! %s", idn)
 
         self._connected = True
@@ -220,26 +289,74 @@ class Piezo:
 
     def get_position(self) -> tuple:
         """
-        현재 XYZ 위치 반환 (폴링 방식 — 응답 오면 바로 반환)
+        현재 XYZ 위치 반환
 
         Returns
         -------
         tuple : (x, y, z) in µm
         """
         self._check_connected()
-        self._gateway.send('POS?\n')
+        raw = self._query('POS?', timeout=5.0)
+        return self._parse_position(raw)
 
-        # 응답이 올 때까지 최대 5초 대기
-        deadline = time.time() + 5.0
+    # ──────────────────────────────────────────────────
+    # 네트워크 정보 조회 (LAN 연결용 IP 확인)
+    # ──────────────────────────────────────────────────
+
+    def get_network_info(self) -> dict:
+        """
+        컨트롤러 네트워크 설정 조회 (USB 연결 상태에서 호출)
+
+        LAN(TCP/IP) 연결로 전환하기 전에 IP 주소를 확인하는 용도.
+        PI GCS 표준 IFC? 명령을 사용해 모든 인터페이스 파라미터를 일괄 조회.
+
+        ⚠ 과거 버전은 IPADR?/MAC?/IPSTART? 개별 쿼리를 썼는데, E-727이
+        이 명령들을 인식하지 못해서 USB 통신 큐가 깨지는 문제가 있었음.
+
+        Returns
+        -------
+        dict
+            컨트롤러가 반환한 모든 인터페이스 파라미터 (key=value 형식).
+            펌웨어 01.038 기준 예시:
+              {'RSBAUD': '115200',
+               'IPADR': '10.10.2.175:50000',
+               'MACADR': 'd8-47-8f-c0-b7-f3',
+               'IPMASK': '255.255.255.0',
+               'IPSTART': '0'}              # 0 = static, 1 = DHCP
+        """
+        self._check_connected()
+        raw = self._query('IFC?', timeout=3.0)
+
+        params = {}
+        for line in raw.replace(' \n', '\n').strip().split('\n'):
+            if '=' in line:
+                k, v = line.split('=', 1)
+                params[k.strip()] = v.strip()
+        return params
+
+    def _query(self, cmd: str, timeout: float = 3.0) -> str:
+        """
+        GCS 쿼리 — PI GCS 멀티라인 응답 종결 규칙으로 폴링.
+
+        응답 종결 규칙:
+            - 단일 라인:  '<data>\\n'
+            - 멀티 라인:  '<data> \\n<data> \\n...<data>\\n'
+                         (마지막 라인 외에는 ' \\n' = 스페이스+LF로 이어짐)
+        """
+        self._gateway.send(cmd + '\n')
+        deadline = time.time() + timeout
+        buf = ""
         while time.time() < deadline:
             try:
                 raw = self._gateway.read()
-                if '=' in raw:
-                    return self._parse_position(raw)
+                if raw:
+                    buf += raw
             except Exception:
-                time.sleep(0.05)
-
-        raise TimeoutError("위치 읽기 타임아웃")
+                pass
+            if buf.endswith('\n') and not buf.endswith(' \n'):
+                return buf.strip()
+            time.sleep(0.02)
+        raise TimeoutError(f"{cmd} 응답 타임아웃 (받은 데이터: {buf!r})")
 
     @property
     def x(self) -> float:
@@ -313,31 +430,18 @@ class Piezo:
     # 내부 헬퍼
     # ──────────────────────────────────────────────────
 
-    def _read_idn(self) -> str:
-        """
-        IDN 읽기
-        E-727은 연결 직후 IDN을 먼저 읽어야 다른 명령어를 받음
-        응답이 두 번에 나눠서 옴
-        """
-        self._gateway.send('*IDN?\n')
-        time.sleep(1.0)
-        idn1 = self._gateway.read()
-        time.sleep(0.5)
-        idn2 = self._gateway.read()
-        return (idn1.strip() + idn2.strip())
-
     def _wait_on_target(self, timeout: float = 10.0) -> None:
-        """이동 완료 대기 (폴링 방식)"""
+        """이동 완료 대기 (폴링 방식). 모든 축 ONT=1 되면 종료."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            self._gateway.send('ONT?\n')
-            time.sleep(0.1)
             try:
-                resp = self._gateway.read()
-                if resp.count('1') >= 3:
+                resp = self._query('ONT?', timeout=1.0)
+                # 응답 형식: '1=1 \n2=1 \n3=1' — 1=1 패턴이 3번이면 모두 ON-TARGET
+                if resp.count('=1') >= 3:
                     return
-            except Exception:
+            except TimeoutError:
                 pass
+            time.sleep(0.05)
         logger.warning("이동 타임아웃!")
 
     def _parse_position(self, raw: str) -> tuple:
